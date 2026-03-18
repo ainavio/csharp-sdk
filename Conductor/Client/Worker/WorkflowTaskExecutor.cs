@@ -307,8 +307,18 @@ namespace Conductor.Client.Worker
                     + $", workflowId: {task.WorkflowInstanceId}"
                     + $", CancelToken: {token}"
                 );
-                UpdateTask(taskResult);
+
+                // task-update-v2: update and get next task in one call when server supports it.
+                var nextTask = UpdateTask(taskResult);
                 _workflowTaskMonitor.RecordTaskSuccess();
+
+                // If the server returned the next task directly, process it immediately
+                // without an additional poll round-trip.
+                if (nextTask != null && (token == CancellationToken.None || !token.IsCancellationRequested))
+                {
+                    _workflowTaskMonitor.IncrementRunningWorker();
+                    _ = System.Threading.Tasks.Task.Run(() => ProcessTask(nextTask, token));
+                }
             }
             catch (Exception e)
             {
@@ -369,7 +379,11 @@ namespace Conductor.Client.Worker
             );
         }
 
-        private void UpdateTask(Models.TaskResult taskResult)
+        /// <summary>
+        /// Updates a task result and returns the next task if the server supports task-update-v2,
+        /// or null when falling back to v1.
+        /// </summary>
+        private Models.Task UpdateTask(Models.TaskResult taskResult)
         {
             taskResult.WorkerId = taskResult.WorkerId ?? _workerSettings.WorkerId;
             for (var attemptCounter = 0; attemptCounter < UPDATE_TASK_RETRY_COUNT_LIMIT; attemptCounter += 1)
@@ -382,15 +396,16 @@ namespace Conductor.Client.Worker
                         Sleep(TimeSpan.FromSeconds(1 << attemptCounter));
                     }
 
-                    _taskClient.UpdateTask(taskResult);
+                    var nextTask = _taskClient.UpdateTaskAndGetNext(taskResult, _worker.TaskType, _workerSettings.WorkerId, _workerSettings.Domain);
                     _logger.LogTrace(
                         $"[{_workerSettings.WorkerId}] Done updating task"
                         + $", taskType: {_worker.TaskType}"
                         + $", domain: {_workerSettings.Domain}"
                         + $", taskId: {taskResult.TaskId}"
                         + $", workflowId: {taskResult.WorkflowInstanceId}"
+                        + (nextTask != null ? $", nextTaskId: {nextTask.TaskId}" : ", no next task")
                     );
-                    return;
+                    return nextTask;
                 }
                 catch (Exception e)
                 {
