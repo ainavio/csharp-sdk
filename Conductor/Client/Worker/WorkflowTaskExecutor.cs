@@ -10,12 +10,13 @@
  * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
  * specific language governing permissions and limitations under the License.
  */
+using Conductor.Client.Events;
 using Conductor.Client.Interfaces;
 using Conductor.Client.Extensions;
+using Conductor.Client.Telemetry;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Threading;
 using Conductor.Client.Models;
 
@@ -98,11 +99,11 @@ namespace Conductor.Client.Worker
                 try
                 {
                     Work4Ever(token);
-                    return; // Normal exit (shouldn't happen, but just in case)
+                    return;
                 }
                 catch (OperationCanceledException)
                 {
-                    return; // Intentional cancellation, don't restart
+                    return;
                 }
                 catch (Exception e)
                 {
@@ -121,8 +122,8 @@ namespace Conductor.Client.Worker
                         + $", taskName: {_worker.TaskType}"
                         + $", error: {e.Message}"
                     );
-                    Telemetry.ConductorMetrics.WorkerRestartCount.Add(1,
-                        new System.Collections.Generic.KeyValuePair<string, object>("taskType", _worker.TaskType));
+                    ConductorMetrics.WorkerRestartCount.Add(1,
+                        new KeyValuePair<string, object>("taskType", _worker.TaskType));
                     Sleep(_workerSettings.RestartDelay);
                 }
             }
@@ -137,7 +138,6 @@ namespace Conductor.Client.Worker
                     if (token != CancellationToken.None)
                         token.ThrowIfCancellationRequested();
 
-                    // Check if worker is paused via environment variable
                     if (IsWorkerPaused())
                     {
                         _logger.LogDebug(
@@ -168,7 +168,6 @@ namespace Conductor.Client.Worker
                         + $", domain: {_worker.WorkerSettings.Domain}"
                         + $", batchSize: {_workerSettings.BatchSize}"
                     );
-                    // Use adaptive backoff on errors too
                     IncreaseBackoff();
                     Sleep(_currentBackoff);
                 }
@@ -188,7 +187,6 @@ namespace Conductor.Client.Worker
                 return;
             }
 
-            // Reset backoff when tasks are found
             ResetBackoff();
 
             var uniqueBatchId = Guid.NewGuid();
@@ -213,6 +211,7 @@ namespace Conductor.Client.Worker
                 + $", domain: {_workerSettings.Domain}"
                 + $", batchSize: {_workerSettings.BatchSize}"
             );
+
             var availableWorkerCounter = _workerSettings.BatchSize - _workflowTaskMonitor.GetRunningWorkers();
             if (availableWorkerCounter < 1)
             {
@@ -220,33 +219,49 @@ namespace Conductor.Client.Worker
                 return new List<Task>();
             }
 
+            var tags = new KeyValuePair<string, object>("taskType", _worker.TaskType);
+            ConductorMetrics.TaskPollCount.Add(1, tags);
+
             try
             {
-                var tasks = _taskClient.PollTask(_worker.TaskType, _workerSettings.WorkerId, _workerSettings.Domain,
-                    availableWorkerCounter);
-                if (tasks == null)
+                Models.Task[] tasks;
+                using (ConductorMetrics.Time(ConductorMetrics.TaskPollLatency, tags))
                 {
-                    tasks = new List<Models.Task>();
+                    var result = _taskClient.PollTask(_worker.TaskType, _workerSettings.WorkerId, _workerSettings.Domain, availableWorkerCounter);
+                    tasks = result == null ? Array.Empty<Models.Task>() : result.ToArray();
                 }
 
                 _logger.LogTrace(
-                    $"[{_workerSettings.WorkerId}] Polled {tasks.Count} tasks"
+                    $"[{_workerSettings.WorkerId}] Polled {tasks.Length} tasks"
                     + $", taskType: {_worker.TaskType}"
                     + $", domain: {_workerSettings.Domain}"
                     + $", batchSize: {_workerSettings.BatchSize}"
                 );
 
-                _workflowTaskMonitor.RecordPollSuccess(tasks.Count);
-                return tasks;
+                if (tasks.Length == 0)
+                {
+                    ConductorMetrics.TaskPollEmptyCount.Add(1, tags);
+                    EventDispatcher.Instance.OnPollEmpty(_worker.TaskType, _workerSettings.WorkerId);
+                }
+                else
+                {
+                    ConductorMetrics.TaskPollSuccessCount.Add(1, tags);
+                    EventDispatcher.Instance.OnPollSuccess(_worker.TaskType, _workerSettings.WorkerId, new List<Models.Task>(tasks));
+                }
+
+                _workflowTaskMonitor.RecordPollSuccess(tasks.Length);
+                return new List<Models.Task>(tasks);
             }
             catch (Exception e)
             {
                 _logger.LogTrace(
-                    $"[{_workerSettings.WorkerId}] Polling error: {e.Message} "
+                    $"[{_workerSettings.WorkerId}] Polling error: {e.Message}"
                     + $", taskType: {_worker.TaskType}"
                     + $", domain: {_workerSettings.Domain}"
                     + $", batchSize: {_workerSettings.BatchSize}"
                 );
+                ConductorMetrics.TaskPollErrorCount.Add(1, tags);
+                EventDispatcher.Instance.OnPollError(_worker.TaskType, _workerSettings.WorkerId, e);
                 _workflowTaskMonitor.RecordPollError();
                 return new List<Task>();
             }
@@ -256,9 +271,7 @@ namespace Conductor.Client.Worker
         {
             List<System.Threading.Tasks.Task> threads = new List<System.Threading.Tasks.Task>();
             if (tasks == null || tasks.Count == 0)
-            {
                 return;
-            }
 
             foreach (var task in tasks)
             {
@@ -286,22 +299,25 @@ namespace Conductor.Client.Worker
                 + $", CancelToken: {token}"
             );
 
-            // Start lease extension timer if enabled
+            var tags = new KeyValuePair<string, object>("taskType", _worker.TaskType);
+            ConductorMetrics.TaskExecutionCount.Add(1, tags);
+            EventDispatcher.Instance.OnTaskExecutionStarted(_worker.TaskType, task);
+
             Timer leaseTimer = null;
             if (_workerSettings.LeaseExtensionEnabled)
-            {
                 leaseTimer = StartLeaseExtensionTimer(task);
-            }
 
             try
             {
-                TaskResult taskResult =
-                    new TaskResult(taskId: task.TaskId, workflowInstanceId: task.WorkflowInstanceId);
+                TaskResult taskResult;
+                using (ConductorMetrics.Time(ConductorMetrics.TaskExecutionLatency, tags))
+                {
+                    if (token == CancellationToken.None)
+                        taskResult = _worker.Execute(task);
+                    else
+                        taskResult = await _worker.Execute(task, token);
+                }
 
-                if (token == CancellationToken.None)
-                    taskResult = _worker.Execute(task);
-                else
-                    taskResult = await _worker.Execute(task, token);
                 _logger.LogTrace(
                     $"[{_workerSettings.WorkerId}] Done processing task for worker"
                     + $", taskType: {_worker.TaskType}"
@@ -311,17 +327,39 @@ namespace Conductor.Client.Worker
                     + $", CancelToken: {token}"
                 );
 
-                // task-update-v2: update and get next task in one call when server supports it.
+                ConductorMetrics.TaskExecutionSuccessCount.Add(1, tags);
+                EventDispatcher.Instance.OnTaskExecutionCompleted(_worker.TaskType, task, taskResult);
+
                 var nextTask = UpdateTask(taskResult);
                 _workflowTaskMonitor.RecordTaskSuccess();
 
-                // If the server returned the next task directly, process it immediately
-                // without an additional poll round-trip.
                 if (nextTask != null && (token == CancellationToken.None || !token.IsCancellationRequested))
                 {
                     _workflowTaskMonitor.IncrementRunningWorker();
                     _ = System.Threading.Tasks.Task.Run(() => ProcessTask(nextTask, token));
                 }
+            }
+            catch (NonRetryableException e)
+            {
+                // Terminal failure — do not retry, mark as FAILED_WITH_TERMINAL_ERROR
+                _logger.LogError(
+                    $"[{_workerSettings.WorkerId}] Non-retryable failure for task"
+                    + $", taskType: {_worker.TaskType}"
+                    + $", taskId: {task.TaskId}"
+                    + $", reason: {e.Message}"
+                );
+                ConductorMetrics.TaskExecutionErrorCount.Add(1, tags);
+                EventDispatcher.Instance.OnTaskExecutionFailed(_worker.TaskType, task, e);
+
+                var taskResult = new TaskResult(taskId: task.TaskId, workflowInstanceId: task.WorkflowInstanceId);
+                taskResult.Status = TaskResult.StatusEnum.FAILEDWITHTERMINALERROR;
+                taskResult.ReasonForIncompletion = e.Message;
+                taskResult.Logs = new List<TaskExecLog>
+                {
+                    new TaskExecLog { Log = e.ToString(), CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+                };
+                UpdateTask(taskResult);
+                _workflowTaskMonitor.RecordTaskError();
             }
             catch (Exception e)
             {
@@ -333,7 +371,14 @@ namespace Conductor.Client.Worker
                     + $", workflowId: {task.WorkflowInstanceId}"
                     + $", CancelToken: {token}"
                 );
+                ConductorMetrics.TaskExecutionErrorCount.Add(1, tags);
+                EventDispatcher.Instance.OnTaskExecutionFailed(_worker.TaskType, task, e);
+
                 var taskResult = task.Failed(e.Message);
+                taskResult.Logs = new List<TaskExecLog>
+                {
+                    new TaskExecLog { Log = e.ToString(), CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+                };
                 UpdateTask(taskResult);
                 _workflowTaskMonitor.RecordTaskError();
             }
@@ -389,34 +434,43 @@ namespace Conductor.Client.Worker
         internal Models.Task UpdateTask(Models.TaskResult taskResult)
         {
             taskResult.WorkerId = taskResult.WorkerId ?? _workerSettings.WorkerId;
+            var tags = new KeyValuePair<string, object>("taskType", _worker.TaskType);
+            ConductorMetrics.TaskUpdateCount.Add(1, tags);
+
             for (var attemptCounter = 0; attemptCounter < UPDATE_TASK_RETRY_COUNT_LIMIT; attemptCounter += 1)
             {
                 try
                 {
-                    // Retries in increasing time intervals (0s, 2s, 4s, 8s...)
                     if (attemptCounter > 0)
                     {
+                        ConductorMetrics.TaskUpdateRetryCount.Add(1, tags);
                         Sleep(TimeSpan.FromSeconds(1 << attemptCounter));
                     }
 
-                    if (_useUpdateV2)
+                    Models.Task nextTask;
+                    using (ConductorMetrics.Time(ConductorMetrics.TaskUpdateLatency, tags))
                     {
-                        var nextTask = _taskClient.UpdateTaskAndGetNext(taskResult, _worker.TaskType, _workerSettings.WorkerId, _workerSettings.Domain);
-                        _logger.LogTrace(
-                            $"[{_workerSettings.WorkerId}] Done updating task"
-                            + $", taskType: {_worker.TaskType}"
-                            + $", domain: {_workerSettings.Domain}"
-                            + $", taskId: {taskResult.TaskId}"
-                            + $", workflowId: {taskResult.WorkflowInstanceId}"
-                            + (nextTask != null ? $", nextTaskId: {nextTask.TaskId}" : ", no next task")
-                        );
-                        return nextTask;
+                        if (_useUpdateV2)
+                        {
+                            nextTask = _taskClient.UpdateTaskAndGetNext(taskResult, _worker.TaskType, _workerSettings.WorkerId, _workerSettings.Domain);
+                        }
+                        else
+                        {
+                            _taskClient.UpdateTask(taskResult);
+                            nextTask = null;
+                        }
                     }
-                    else
-                    {
-                        _taskClient.UpdateTask(taskResult);
-                        return null;
-                    }
+
+                    _logger.LogTrace(
+                        $"[{_workerSettings.WorkerId}] Done updating task"
+                        + $", taskType: {_worker.TaskType}"
+                        + $", domain: {_workerSettings.Domain}"
+                        + $", taskId: {taskResult.TaskId}"
+                        + $", workflowId: {taskResult.WorkflowInstanceId}"
+                        + (nextTask != null ? $", nextTaskId: {nextTask.TaskId}" : ", no next task")
+                    );
+                    EventDispatcher.Instance.OnTaskUpdateSent(_worker.TaskType, taskResult);
+                    return nextTask;
                 }
                 catch (ApiException e) when (_useUpdateV2 && (e.ErrorCode == 404 || e.ErrorCode == 405))
                 {
@@ -426,10 +480,10 @@ namespace Conductor.Client.Worker
                         + $", taskType: {_worker.TaskType}"
                     );
                     _useUpdateV2 = false;
-                    // Retry immediately with v1
                     try
                     {
                         _taskClient.UpdateTask(taskResult);
+                        EventDispatcher.Instance.OnTaskUpdateSent(_worker.TaskType, taskResult);
                         return null;
                     }
                     catch (Exception fallbackEx)
@@ -450,9 +504,11 @@ namespace Conductor.Client.Worker
                         + $", taskId: {taskResult.TaskId}"
                         + $", workflowId: {taskResult.WorkflowInstanceId}"
                     );
+                    ConductorMetrics.TaskUpdateErrorCount.Add(1, tags);
                 }
             }
 
+            EventDispatcher.Instance.OnTaskUpdateFailed(_worker.TaskType, taskResult, new Exception("Failed to update task after retries"));
             throw new Exception("Failed to update task after retries");
         }
 
@@ -499,10 +555,6 @@ namespace Conductor.Client.Worker
         {
             _logger.LogDebug($"[{_workerSettings.WorkerId}] Sleeping for {timeSpan.TotalMilliseconds}ms");
             Thread.Sleep(timeSpan);
-        }
-
-        private void LogInfo()
-        {
         }
     }
 }
