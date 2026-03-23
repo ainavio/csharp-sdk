@@ -22,9 +22,9 @@ COPY /csharp-examples /package/csharp-examples
 COPY /Tests           /package/Tests
 WORKDIR /package/Tests
 RUN dotnet test -p:DefineConstants=EXCLUDE_EXAMPLE_WORKERS \
+                --filter "Category!=CloudIntegration&Category!=Integration" \
                 --collect:"XPlat Code Coverage" \
-                -l "console;verbosity=normal" \
-    || true
+                -l "console;verbosity=normal"
 
 FROM test AS coverage_export
 RUN mkdir /out \
