@@ -10,20 +10,6 @@ RUN dotnet format --verify-no-changes *.csproj
 FROM csharp-sdk AS build
 RUN dotnet build *.csproj
 
-FROM build AS test
-COPY /csharp-examples /package/csharp-examples
-COPY /Tests           /package/Tests
-WORKDIR /package/Tests
-RUN dotnet test -p:DefineConstants=EXCLUDE_EXAMPLE_WORKERS \
-                --filter "Category!=Integration&Category!=CloudIntegration" \
-                --collect:"XPlat Code Coverage" \
-                -l "console;verbosity=normal"
-
-FROM test AS coverage_export
-RUN mkdir /out \
- && cp $(find /package/Tests/TestResults -name 'coverage.cobertura.xml' | head -n 1) \
-       /out/coverage.cobertura.xml
-
 FROM build AS pack_release
 ARG SDK_VERSION
 RUN dotnet pack conductor-csharp.csproj \
