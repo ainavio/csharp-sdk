@@ -58,6 +58,15 @@ namespace Conductor.Client.Worker
         }
 
         /// <summary>
+        /// Clears the current thread's WorkflowTaskContext to release task payload references.
+        /// Must be called after task execution completes to prevent ThreadLocal memory retention.
+        /// </summary>
+        public static void Clear()
+        {
+            TASK_CONTEXT_INHERITABLE_THREAD_LOCAL.Value = null;
+        }
+
+        /// <summary>
         /// Method to get the WorkflowInstanceId
         /// </summary>
         /// <returns></returns>
